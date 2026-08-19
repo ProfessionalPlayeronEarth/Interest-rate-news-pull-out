@@ -1,0 +1,193 @@
+# =====================================================================
+#  美股利率快讯 · 微信推送  —— 配置文件
+#  改完这份文件，基本就能跑了，不需要碰代码。
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 1) 微信推送渠道（三选一，或都填上）
+#    channel 决定默认用哪个；若默认渠道没填 token，会自动按顺序尝试
+#    serverchan > pushplus > wecom > console
+#    - console  : 只打印到屏幕，不真正推送（调试用，默认）
+#    - serverchan: 微信扫码关注「方糖」公众号即可收消息，免费
+#    - pushplus  : 微信关注「PushPlus 推送加」公众号，免费
+#    - wecom     : 企业微信群机器人 webhook（公司群常用）
+# ---------------------------------------------------------------------
+push:
+  channel: console
+  serverchan:
+    sendkey: ""          # 去 https://sct.ftqq.com 登录后拿到 SENDKEY
+  pushplus:
+    token: ""            # 去 https://www.pushplus.plus 登录后拿到 token
+  wecom:
+    webhook: ""          # 企业微信「群机器人」的 webhook 地址
+
+# ---------------------------------------------------------------------
+# 2) 新闻源（RSS）。可自行增删，不需要的源前面加 # 注释掉即可。
+#    官方/主流媒体源更稳定；部分财经站 RSS 偶尔会被反爬拦截。
+# ---------------------------------------------------------------------
+sources:
+  - name: "CNBC Markets"
+    url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
+  - name: "MarketWatch"
+    url: "https://feeds.content.dowjones.io/public/rss/mw_topstories"
+  - name: "WSJ Markets"
+    url: "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
+  - name: "Federal Reserve"
+    url: "https://www.federalreserve.gov/feeds/press_all.xml"
+  # - name: "Investing.com"
+  #   url: "https://www.investing.com/rss/news.rss"
+
+# ---------------------------------------------------------------------
+# 3) 利率相关关键词（标题或摘要命中任一即视为「利率快讯」）
+#    中英文都写，覆盖更广。可自由增删。
+# ---------------------------------------------------------------------
+rate_keywords:
+  - "rate"
+  - "rates"
+  - "interest rate"
+  - "federal reserve"
+  - "fomc"
+  - "powell"
+  - "treasury"
+  - "yield"
+  - "yields"
+  - "bond"
+  - "bonds"
+  - "inflation"
+  - "ecb"
+  - "rate cut"
+  - "rate hike"
+  - "降息"
+  - "加息"
+  - "利率"
+  - "美联储"
+  - "国债"
+  - "通胀"
+  - "收益率"
+  - "鲍威尔"
+
+# 额外「强相关」关键词：命中会排在前面并标 ⭐，让你一眼看到最关键的消息
+strong_keywords:
+  - "rate cut"
+  - "rate hike"
+  - "interest rate"
+  - "fomc"
+  - "federal reserve"
+  - "powell"
+  - "treasury yield"
+  - "降息"
+  - "加息"
+  - "利率"
+  - "美联储"
+  - "鲍威尔"
+
+# ---------------------------------------------------------------------
+# 4) 抓取控制
+# ---------------------------------------------------------------------
+fetch:
+  max_items_per_source: 30    # 每个源每次最多读取的条目数
+  lookback_hours: 24          # 只推送最近 N 小时内的新闻（0 = 不限时间）
+  request_timeout: 15         # 单源请求超时（秒）
+
+# ---------------------------------------------------------------------
+# 5) 推送节奏（本地运行 / 云函数时区，使用「北京时间」）
+#    下面每天 3 次；想只推 1 次，删掉两行即可。
+# ---------------------------------------------------------------------
+schedule:
+  timezone: "Asia/Shanghai"
+  times:
+    - "07:30"
+    - "12:30"
+    - "21:30"
+  run_immediately: false      # true = 启动后立即先跑一次（调试用）
+
+# ---------------------------------------------------------------------
+# 6) 去重（避免同一条新闻重复推）
+# ---------------------------------------------------------------------
+dedup:
+  enabled: true
+  seen_file: "data/seen.json"
+  max_kept: 2000              # 已记录条数上限，超出自动清理最旧的
+
+# ---------------------------------------------------------------------
+# 7) 社媒舆情监测（中东战争等「利率敏感地缘事件」的早期个人发帖）
+#    说明：X(Twitter)/TikTok 已无免费 API，本模块用 Reddit / Mastodon /
+#          Telegram(RSSHub 桥接) —— 这些才是当前 OSINT 早期情报的富矿。
+#    早期信号：发帖很新(early_window_hours 内) 且 主流 RSS 尚未覆盖该战争维度
+#          => 标记为 ⚡，并额外发一条「即时预警」到微信。
+# ---------------------------------------------------------------------
+social:
+  enabled: true
+  urgent_alert: true          # 发现 ⚡ 早期信号时，立即额外推送一条预警（不限于定时）
+  lookback_hours: 12          # 只看最近 N 小时内的社媒发帖
+  early_window_hours: 3       # 发帖距今 < 此值(小时) 视为「新鲜」，可判为早期信号
+  max_items_per_source: 20    # 每个源每次最多读取的条目数
+
+  sources:
+    # —— Reddit：type=reddit，填 subreddit 名称 ——
+    - type: reddit
+      name: "Reddit r/worldnews"
+      subreddit: "worldnews"
+    - type: reddit
+      name: "Reddit r/CombatFootage"
+      subreddit: "CombatFootage"
+    - type: reddit
+      name: "Reddit r/geopolitics"
+      subreddit: "geopolitics"
+    # —— Mastodon：type=mastodon，填实例域名 + 话题标签 ——
+    - type: mastodon
+      name: "Mastodon #MiddleEast"
+      instance: "mastodon.social"
+      tag: "MiddleEast"
+    - type: mastodon
+      name: "Mastodon #Israel"
+      instance: "mastodon.social"
+      tag: "Israel"
+    # —— Telegram 频道：type=rss，用 RSSHub 桥接（把频道名换掉即可）——
+    #     公共实例 rsshub.app 偶尔不稳定，可自行部署 RSSHub 后改 url。
+    - type: rss
+      name: "Telegram(经RSSHub): 示例频道"
+      url: "https://rsshub.app/telegram/channel/breakingmideast"
+
+  # 战争相关关键词：命中即视为「中东/地缘」信号。中英文都写，可自由增删。
+  war_keywords:
+    - "israel"
+    - "iran"
+    - "gaza"
+    - "hamas"
+    - "hezbollah"
+    - "houthis"
+    - "yemen"
+    - "lebanon"
+    - "syria"
+    - "idf"
+    - "irgc"
+    - "missile"
+    - "airstrike"
+    - "airstrikes"
+    - "drone attack"
+    - "invasion"
+    - "ceasefire"
+    - "war"
+    - "conflict"
+    - "strait of hormuz"
+    - "oil price"
+    - "crude"
+    - "middle east"
+    - "red sea"
+    - "中东"
+    - "以色列"
+    - "伊朗"
+    - "加沙"
+    - "哈马斯"
+    - "真主党"
+    - "胡塞"
+    - "黎巴嫩"
+    - "叙利亚"
+    - "导弹"
+    - "空袭"
+    - "战争"
+    - "停火"
+    - "霍尔木兹"
+    - "原油"
+    - "油价"
