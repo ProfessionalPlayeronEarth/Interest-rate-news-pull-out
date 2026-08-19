@@ -11,17 +11,10 @@ jobs:
   push:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    concurrency:
-      group: us-stock-news-push
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-      - name: 设置 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - name: 安装依赖
-        run: pip install -r requirements.txt
+        run: pip install --quiet feedparser requests
       - name: 恢复去重记录
         uses: actions/cache@v4
         with:
@@ -32,36 +25,7 @@ jobs:
       - name: 运行推送
         env:
           TZ: "Asia/Shanghai"
-          PUSH_CHANNEL: ${{ secrets.PUSH_CHANNEL }}
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-        run: |
-          python - <<'PY'
-          import os, yaml
-          from pathlib import Path
-          cfg_path = Path("config.yaml")
-          cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-          sendkey = os.environ.get("SERVERCHAN_SENDKEY")
-          pptoken = os.environ.get("PUSHPLUS_TOKEN")
-          wecom   = os.environ.get("WECOM_WEBHOOK")
-          override = os.environ.get("PUSH_CHANNEL")
-          if override:
-              channel = override
-          elif sendkey:
-              channel = "serverchan"
-          elif pptoken:
-              channel = "pushplus"
-          elif wecom:
-              channel = "wecom"
-          else:
-              channel = "console"
-              print("⚠️ 未检测到推送密钥，将以 console 模式运行。请在仓库 Secrets 填写密钥。")
-          cfg["push"]["channel"] = channel
-          if sendkey: cfg["push"]["serverchan"]["sendkey"] = sendkey
-          if pptoken: cfg["push"]["pushplus"]["token"] = pptoken
-          if wecom:   cfg["push"]["wecom"]["webhook"] = wecom
-          cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
-          print("本次推送渠道:", channel)
-          PY
-          python -m src.main --once
+        run: python bot.py
