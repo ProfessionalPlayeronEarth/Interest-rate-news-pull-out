@@ -45,6 +45,7 @@ CONFIG = {
     "schedule": {"timezone": "Asia/Shanghai",
                  "times": ["07:30", "12:30", "21:30"], "run_immediately": False},
     "dedup": {"enabled": True, "seen_file": "data/seen.json", "max_kept": 2000},
+    "translate": True,          # 是否把英文标题/摘要翻译成中文（失败则回退原文）
     "social": {
         "enabled": True,
         "urgent_alert": True,
@@ -148,6 +149,43 @@ def relative_time(dt):
     if age_s < 86400:
         return f"{int(age_s // 3600)} 小时前"
     return f"{int(age_s // 86400)} 天前"
+
+
+# ------------------------- 翻译（英文 -> 中文）-------------------------
+def _translate_gtx(text: str) -> str:
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": text[:500]}
+    r = requests.get(url, params=params, timeout=8, headers={"User-Agent": UA})
+    r.raise_for_status()
+    data = r.json()
+    parts = [seg[0] for seg in data[0] if seg and seg[0]]
+    return "".join(parts).strip()
+
+
+def _translate_mymemory(text: str) -> str:
+    url = "https://api.mymemory.translated.net/get"
+    params = {"q": text[:500], "langpair": "en|zh-CN"}
+    r = requests.get(url, params=params, timeout=8, headers={"User-Agent": UA})
+    r.raise_for_status()
+    data = r.json()
+    if data.get("responseStatus") == 200 and data.get("responseData", {}).get("translatedText"):
+        return data["responseData"]["translatedText"].strip()
+    return ""
+
+
+def translate_to_zh(text: str) -> str:
+    """把英文翻译成中文。依次尝试 Google / MyMemory 免费接口；都失败则原样回退，绝不中断推送。"""
+    if not text or not text.strip():
+        return text
+    for fn in (_translate_gtx, _translate_mymemory):
+        try:
+            out = fn(text)
+            if out:
+                return out
+        except Exception as exc:  # noqa: BLE001
+            log.warning("翻译通道 %s 失败：%s", fn.__name__, exc)
+        time.sleep(0.3)  # 轻微限流，避免免费接口被封
+    return text
 
 
 # ------------------------- 新闻（RSS）-------------------------
@@ -479,22 +517,32 @@ def _beijing_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=8)
 
 
-def _render_items(items: list[dict], start_idx: int = 1) -> list[str]:
+def _render_items(items: list[dict], start_idx: int = 1, translate: bool = True) -> list[str]:
     lines = []
     for i, it in enumerate(items, start_idx):
         star = "⭐ " if it.get("strong") else ""
         early = "⚡ " if it.get("early") else ""
         rel = relative_time(it.get("published"))
         author = f" @{it['author']}" if it.get("author") else ""
-        lines.append(f"{early}{star}**{i}. {it['title']}**")
+        orig = it.get("title") or ""
+        title_disp = translate_to_zh(orig) if (translate and orig) else orig
+        lines.append(f"{early}{star}**{i}. {title_disp}**")
+        if translate and orig and title_disp != orig:
+            lines.append(f"> _原文：{orig}_")
         lines.append(f"> 🏷 {it['source']}{author} · {rel}")
+        summ = it.get("summary")
+        if summ:
+            summ_disp = translate_to_zh(summ[:200]) if translate else summ[:200]
+            if summ_disp:
+                lines.append(f"> 📝 {summ_disp}")
         if it.get("link"):
             lines.append(f"> 🔗 {it['link']}")
         lines.append("")
     return lines
 
 
-def format_message(items: list[dict], errors: list[str], social_enabled: bool = False):
+def format_message(items: list[dict], errors: list[str], social_enabled: bool = False,
+                   translate: bool = True):
     now = _beijing_now().strftime("%Y-%m-%d %H:%M")
     title = f"📈 美股利率快讯 · 中东局势（{now}）"
     rate_items = [i for i in items if i.get("kind") != "social"]
@@ -502,16 +550,17 @@ def format_message(items: list[dict], errors: list[str], social_enabled: bool = 
     lines = [f"⏰ **{now}（北京时间）** · 利率 **{len(rate_items)}** 条 · 社媒信号 **{len(social_items)}** 条", ""]
     lines.append("## 📈 利率相关快讯")
     if rate_items:
-        lines += _render_items(rate_items)
+        lines += _render_items(rate_items, 1, translate)
     else:
         lines.append("🤷 最近时间窗内没有命中「利率相关」的新闻。\n")
     if social_enabled:
-        lines.append("## ⚡ 中东局势 · 社媒早期信号")
+        lines.append("## ⚡ 中东局势 · 社媒信号")
         if social_items:
             early_n = sum(1 for i in social_items if i.get("early"))
             if early_n:
-                lines.append(f"> 其中 **{early_n}** 条疑似「早于主流媒体」的未覆盖信号\n")
-            lines += _render_items(social_items)
+                lines.append(f"> 其中 **{early_n}** 条疑似早于主流媒体、尚未被主流覆盖的信号，"
+                             f"请重点关注（或影响油价 / 避险 / 利率）\n")
+            lines += _render_items(social_items, len(rate_items) + 1, translate)
         else:
             lines.append("🤷 社媒未监测到中东战争相关的新发帖。\n")
     if errors:
@@ -523,17 +572,9 @@ def format_message(items: list[dict], errors: list[str], social_enabled: bool = 
     return title, "\n".join(lines)
 
 
-def format_early_alert(items: list[dict]):
-    now = _beijing_now().strftime("%Y-%m-%d %H:%M")
-    title = f"⚡ 中东局势·早于主流的社媒信号（{now}）"
-    lines = ["⚠️ **检测到可能早于主流媒体报道的中东局势信号，请关注（或影响油价/避险/利率）**", ""]
-    lines += _render_items(items)
-    lines.append("_由 us-stock-news 自动推送 · 此为主流尚未覆盖的早期信号_")
-    return title, "\n".join(lines)
-
-
 # ------------------------- 主流程 -------------------------
 def run_once(cfg: dict) -> None:
+    translate = cfg.get("translate", True)
     log.info("开始抓取新闻源…")
     news_items, news_errors = collect_news(cfg)
     for it in news_items:
@@ -550,34 +591,16 @@ def run_once(cfg: dict) -> None:
                  len(social_errors))
 
     errors = news_errors + social_errors
-
-    store = None
-    if social_enabled:
-        for it in social_items:
-            if "early" not in it:
-                ew = cfg.get("social", {}).get("early_window_hours", 3)
-                it["early"] = bool(it.get("matched") and it.get("fresh_minutes") is not None
-                                   and it["fresh_minutes"] <= ew * 60)
-        store = SeenStore(cfg["dedup"]["seen_file"], cfg["dedup"].get("max_kept", 2000))
-        early = [i for i in social_items if i.get("early")]
-        if early and cfg.get("social", {}).get("urgent_alert", True):
-            etitle, econtent = format_early_alert(early)
-            ok, msg = push(cfg, etitle, econtent)
-            log.info("早期信号即时预警：%s", "成功" if ok else f"失败({msg})")
-            for i in early:
-                store.add(i.get("id") or i.get("link") or i.get("title"))
-            social_items = [i for i in social_items if not i.get("early")]
-
     combined = news_items + social_items
 
+    # 全部合并为「一条」推送：早期信号不再单独发，直接带 ⚡ 标记进摘要
     if cfg.get("dedup", {}).get("enabled", True):
-        if store is None:
-            store = SeenStore(cfg["dedup"]["seen_file"], cfg["dedup"].get("max_kept", 2000))
+        store = SeenStore(cfg["dedup"]["seen_file"], cfg["dedup"].get("max_kept", 2000))
         before = len(combined)
         combined = store.filter_new(combined)
         log.info("去重后待推送 %d 条（去除已推送 %d 条）。", len(combined), before - len(combined))
 
-    title, content = format_message(combined, errors, social_enabled)
+    title, content = format_message(combined, errors, social_enabled, translate)
 
     if not combined:
         log.info("没有新内容，跳过推送。")
