@@ -923,12 +923,16 @@ def format_social_abstract(social_items: list[dict], translate: bool = True) -> 
     for idx, it in enumerate(social_items, 1):
         raw = (it.get("title") or it.get("text") or "")[:120]
         disp = translate_to_zh(raw) if (translate and raw) else raw
+        disp = disp.replace("\n", " ").strip()   # 压平摘要内换行，避免破坏分行列点
         early = "⚡ " if it.get("early") else ""
         link = it.get("url") or it.get("link") or ""
         icon = f" [🔗]({link})" if link else ""   # 点击图标即可进入原始帖子
         src = it.get("source", "")
-        lines.append(f"> {early}{idx}. {disp}{icon}")
-        lines.append(f"> · 来源：{src} · {relative_time(it.get('published'))}")
+        rtime = relative_time(it.get("published"))
+        # 每条消息：主行（编号+摘要+🔗）+ 子列点（来源 / 时间），分行更易读
+        lines.append(f"> {idx}. {early}{disp}{icon}")
+        lines.append(f">    · 来源：{src}")
+        lines.append(f">    · 时间：{rtime}")
     if early_n:
         lines.append("> ⚠️ 其中早期信号可能早于主流媒体，请重点关注（或影响油价 / 避险 / 利率）。")
     return lines
