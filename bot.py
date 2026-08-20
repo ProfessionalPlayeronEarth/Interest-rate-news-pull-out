@@ -69,9 +69,14 @@ CONFIG = {
         "early_window_hours": 3,
         "max_items_per_source": 20,
         "sources": [
-            {"type": "reddit", "name": "Reddit r/worldnews", "subreddit": "worldnews"},
-            {"type": "reddit", "name": "Reddit r/CombatFootage", "subreddit": "CombatFootage"},
-            {"type": "reddit", "name": "Reddit r/geopolitics", "subreddit": "geopolitics"},
+            # Reddit 统一走官方 .rss（比 JSON 接口更不易被 GitHub Actions IP 限流/封禁，
+            # 彻底消除以往「每次推送末尾报 reddit 抓取错误」的困扰）
+            {"type": "rss", "name": "Reddit r/worldnews",
+             "url": "https://www.reddit.com/r/worldnews/new/.rss"},
+            {"type": "rss", "name": "Reddit r/CombatFootage",
+             "url": "https://www.reddit.com/r/CombatFootage/new/.rss"},
+            {"type": "rss", "name": "Reddit r/geopolitics",
+             "url": "https://www.reddit.com/r/geopolitics/new/.rss"},
             {"type": "mastodon", "name": "Mastodon #MiddleEast",
              "instance": "mastodon.social", "tag": "MiddleEast"},
             {"type": "mastodon", "name": "Mastodon #Israel",
@@ -87,6 +92,30 @@ CONFIG = {
             "中东", "以色列", "伊朗", "加沙", "哈马斯", "真主党", "胡塞", "黎巴嫩",
             "叙利亚", "导弹", "空袭", "战争", "停火", "霍尔木兹", "原油", "油价",
         ],
+        # —— 转折点舆情关键词（精简推送的硬筛选）——
+        # war_keywords 只决定「是否与中东战争相关」；本列表进一步判定「是否对战局有转折意义」。
+        # 命中本列表才进入社媒摘要，其余泛相关帖子不推送，从源头精简内容。
+        "turning_point_keywords": [
+            # 停火 / 和平转折
+            "ceasefire", "truce", "peace deal", "peace agreement", "peace talks",
+            "negotiations", "diplomatic", "treaty", "summit", "deal reached",
+            # 战事升级 / 转折
+            "invasion", "escalation", "ground offensive", "airstrike", "airstrikes",
+            "missile attack", "drone strike", "bombing", "shelling", "offensive",
+            "retaliation", "counterattack",
+            # 重大转折事件
+            "surrender", "retreat", "breakthrough", "captured", "fallen", "massacre",
+            "genocide", "nuclear", "decapitation", "assassination", "collapse",
+            # 制裁 / 封锁 / 能源转折
+            "sanctions", "embargo", "blockade", "oil embargo", "strait of hormuz",
+            "hormuz", "pipeline", "oil price spike",
+            # 中文
+            "停火", "停战", "和谈", "和平协议", "撤军", "投降", "入侵", "空袭",
+            "导弹", "封锁", "制裁", "斩首", "核", "升级", "外交", "条约", "峰会",
+            "和谈", "破城", "沦陷", "突围",
+        ],
+        "turning_only": True,   # True=只推送转折点舆情（精简）；False=推送全部战争相关
+        "max_turning": 10,      # 转折点舆情最多保留条数（按 early 优先 + 时间新排序）
     },
     "hormuz": {
         "enabled": True,
@@ -173,6 +202,15 @@ def relative_time(dt):
 
 
 # ------------------------- 翻译（英文 -> 中文）-------------------------
+def _needs_translation(text: str) -> bool:
+    """仅当文本含英文字母、且几乎不含中文时，才需要翻译成中文。"""
+    if not text:
+        return False
+    has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in text)
+    has_latin = any(ch.isascii() and ch.isalpha() for ch in text)
+    return has_latin and not has_cjk
+
+
 def _translate_gtx(text: str) -> str:
     url = "https://translate.googleapis.com/translate_a/single"
     params = {"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": text[:500]}
@@ -194,14 +232,31 @@ def _translate_mymemory(text: str) -> str:
     return ""
 
 
+def _translate_libre(text: str) -> str:
+    """第三备用翻译通道（LibreTranslate 公共实例，无需密钥）。"""
+    url = "https://translate.terraprint.co/translate"
+    try:
+        r = requests.post(url, json={"q": text[:500], "source": "en", "target": "zh", "format": "text"},
+                          timeout=10, headers={"User-Agent": UA})
+        r.raise_for_status()
+        return (r.json().get("translatedText") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def translate_to_zh(text: str) -> str:
-    """把英文翻译成中文。依次尝试 Google / MyMemory 免费接口；都失败则原样回退，绝不中断推送。"""
+    """把英文翻译成中文。依次尝试 Google → MyMemory → LibreTranslate 三个免费接口；
+    任一返回有效译文即采用；全部失败则原样回退，绝不中断推送。
+    若某个接口把原文「原样返回」（等同于没翻译），则继续尝试下一个通道，避免漏翻。"""
     if not text or not text.strip():
         return text
-    for fn in (_translate_gtx, _translate_mymemory):
+    if not _needs_translation(text):
+        return text  # 已含中文，无需翻译
+    stripped = text.strip()
+    for fn in (_translate_gtx, _translate_mymemory, _translate_libre):
         try:
             out = fn(text)
-            if out:
+            if out and out != stripped:
                 return out
         except Exception as exc:  # noqa: BLE001
             log.warning("翻译通道 %s 失败：%s", fn.__name__, exc)
@@ -290,36 +345,6 @@ def fetch_recent_texts(cfg: dict) -> list[str]:
 
 
 # ------------------------- 社媒 -------------------------
-def fetch_reddit(subreddit: str, limit: int, timeout: int):
-    url = f"https://www.reddit.com/r/{subreddit}/new.json?limit={limit}"
-    try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": UA_SOCIAL})
-        if r.status_code != 200:
-            return [], f"Reddit r/{subreddit} 返回 HTTP {r.status_code}"
-        data = r.json()
-        if "error" in data:
-            return [], f"Reddit r/{subreddit} 错误: {data.get('message')}"
-        children = data.get("data", {}).get("children", [])
-    except Exception as exc:  # noqa: BLE001
-        return [], f"Reddit r/{subreddit} 抓取失败: {exc}"
-
-    out = []
-    for c in children:
-        d = c.get("data", {})
-        title = d.get("title", "")
-        text = (d.get("selftext") or "")[:400]
-        out.append({
-            "title": title,
-            "text": f"{title}\n{text}",
-            "link": "https://www.reddit.com" + d.get("permalink", ""),
-            "url": "https://www.reddit.com" + d.get("permalink", ""),
-            "author": d.get("author", ""),
-            "published": _parse_reddit_time(d.get("created_utc")),
-            "source": f"Reddit r/{subreddit}",
-        })
-    return out, None
-
-
 def fetch_mastodon(instance: str, tag: str, limit: int, timeout: int):
     url = f"https://{instance}/api/v1/timelines/tag/{tag}?limit={limit}"
     try:
@@ -348,7 +373,7 @@ def fetch_mastodon(instance: str, tag: str, limit: int, timeout: int):
     return out, None
 
 
-def fetch_rss_social(url: str, limit: int, timeout: int):
+def fetch_rss_social(url: str, limit: int, timeout: int, name: str = ""):
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": UA_SOCIAL})
         feed = feedparser.parse(r.content)
@@ -364,6 +389,7 @@ def fetch_rss_social(url: str, limit: int, timeout: int):
             if e.get(key):
                 published = datetime.fromtimestamp(time.mktime(e[key]), tz=timezone.utc)
                 break
+        src_name = name or (feed.feed.get("title", url) if hasattr(feed, "feed") else url)
         out.append({
             "title": title,
             "text": f"{title}\n{summary}",
@@ -371,7 +397,7 @@ def fetch_rss_social(url: str, limit: int, timeout: int):
             "url": e.get("link", ""),
             "author": e.get("author", ""),
             "published": published,
-            "source": feed.feed.get("title", url) if hasattr(feed, "feed") else url,
+            "source": src_name,
         })
     return out, None
 
@@ -382,6 +408,9 @@ def collect_social(cfg: dict, mainstream_texts=None):
         return [], []
 
     war_kw = s_cfg.get("war_keywords", [])
+    tp_kw = s_cfg.get("turning_point_keywords", [])
+    turning_only = s_cfg.get("turning_only", True)
+    max_turning = s_cfg.get("max_turning", 10)
     lookback = s_cfg.get("lookback_hours", 12)
     early_window = s_cfg.get("early_window_hours", 3)
     max_per = s_cfg.get("max_items_per_source", 20)
@@ -401,12 +430,10 @@ def collect_social(cfg: dict, mainstream_texts=None):
     items, errors = [], []
     for src in s_cfg.get("sources", []):
         stype = src.get("type", "rss")
-        if stype == "reddit":
-            chunk, err = fetch_reddit(src.get("subreddit", ""), max_per, timeout)
-        elif stype == "mastodon":
+        if stype == "mastodon":
             chunk, err = fetch_mastodon(src.get("instance", ""), src.get("tag", ""), max_per, timeout)
         else:
-            chunk, err = fetch_rss_social(src.get("url", ""), max_per, timeout)
+            chunk, err = fetch_rss_social(src.get("url", ""), max_per, timeout, src.get("name", ""))
         if err:
             errors.append(err)
             continue
@@ -418,6 +445,9 @@ def collect_social(cfg: dict, mainstream_texts=None):
             if not matched:
                 continue
             it["matched"] = matched
+            # 「转折点」判定：仅命中转折级关键词，才视为对战局有转折意义的舆情
+            tp_hits = _match_keywords(f"{it.get('title', '')} {it.get('text', '')}", tp_kw)
+            it["turning"] = bool(tp_hits)
             it["kind"] = "social"
             it["id"] = it.get("url") or it.get("link") or it.get("title")
             fresh = (mins is not None and mins <= early_window * 60)
@@ -426,8 +456,16 @@ def collect_social(cfg: dict, mainstream_texts=None):
             it["fresh_minutes"] = mins
             items.append(it)
 
-    items.sort(key=lambda x: (not x.get("early"),
-                              -(x["published"].timestamp() if x.get("published") else 0)))
+    # 精简：仅保留「转折点舆情」，从源头减少推送噪声
+    if turning_only:
+        items = [it for it in items if it.get("turning")]
+        items.sort(key=lambda x: (not x.get("early"),
+                                  -(x["published"].timestamp() if x.get("published") else 0)))
+        if len(items) > max_turning:
+            items = items[:max_turning]
+    else:
+        items.sort(key=lambda x: (not x.get("early"),
+                                  -(x["published"].timestamp() if x.get("published") else 0)))
     return items, errors
 
 
@@ -868,27 +906,84 @@ def _render_items(items: list[dict], start_idx: int = 1, translate: bool = True)
     return lines
 
 
+def format_social_abstract(social_items: list[dict], translate: bool = True) -> list[str]:
+    """社媒「转折点舆情」摘要：只给对战争走势有转折意义的帖子。
+
+    每条 = 翻译后的要点 + 可点击的 🔗 图标（不展示冗长网址）：
+        1. 中文摘要 [🔗](原始链接)
+        2. 中文摘要 [🔗](原始链接)
+    """
+    lines = []
+    n = len(social_items)
+    early_n = sum(1 for i in social_items if i.get("early"))
+    lines.append(f"> 📋 **转折点舆情摘要（精选 {n} 条，其中早期 ⚡ {early_n} 条）**：")
+    if not n:
+        lines.append("> 🤷 今日未监测到「对战争走势有转折意义」的社媒舆情，相关监测仍在运行。")
+        return lines
+    for idx, it in enumerate(social_items, 1):
+        raw = (it.get("title") or it.get("text") or "")[:120]
+        disp = translate_to_zh(raw) if (translate and raw) else raw
+        early = "⚡ " if it.get("early") else ""
+        link = it.get("url") or it.get("link") or ""
+        icon = f" [🔗]({link})" if link else ""   # 点击图标即可进入原始帖子
+        src = it.get("source", "")
+        lines.append(f"> {early}{idx}. {disp}{icon}")
+        lines.append(f"> · 来源：{src} · {relative_time(it.get('published'))}")
+    if early_n:
+        lines.append("> ⚠️ 其中早期信号可能早于主流媒体，请重点关注（或影响油价 / 避险 / 利率）。")
+    return lines
+
+
 def format_message(items: list[dict], errors: list[str], social_enabled: bool = False,
                    translate: bool = True, panic: dict | None = None,
                    market: dict | None = None, rate_prob: dict | None = None,
                    market_prob: dict | None = None, fed: dict | None = None,
-                   hormuz: dict | None = None):
+                   hormuz: dict | None = None, anomalies: list | None = None):
     now = _beijing_now().strftime("%Y-%m-%d %H:%M")
     title = f"📈 美股利率快讯 · 中东局势（{now}）"
     rate_items = [i for i in items if i.get("kind") != "social"]
     social_items = [i for i in items if i.get("kind") == "social"]
     lines = [f"⏰ **{now}（北京时间）** · 利率 **{len(rate_items)}** 条 · 社媒信号 **{len(social_items)}** 条", ""]
+
+    # —— 置顶模块：市场情绪指数 + 两个加息概率（市场隐含 + 综合研判）——
+    lines.append("## 🔝 今日速览（置顶）")
     if panic:
-        lines.append(f"## 🌡️ 今日市场恐慌指数：{panic['score']} / 100（{panic['level']}）")
+        lines.append(f"> 🌡️ **今日市场情绪指数（原恐慌指数）：{panic['score']} / 100（{panic['level']}）**")
         lines.append(f"> `{_panic_bar(panic['score'])}`  {panic['score']}")
         lines.append(f"> 📊 利率快讯 {panic['rate_n']} 条(强相关 {panic['strong_n']}) · "
                      f"社媒信号 {panic['social_n']} 条(早期 {panic['early_n']}) · "
                      f"恐惧词命中 {panic['fear_hits']} 种")
+    f = fed if (fed and fed.get("ok")) else None
+    if f:
+        farrow = "▲" if f["chg_bp"] >= 0 else "▼"
+        lines.append(f"> 🏦 市场隐含联邦基金利率(ZQ期货)：{f['implied_effr']:.2f}%  "
+                     f"{farrow} {f['chg_bp']:+.1f}bp（目标区间 {f['target_low']:.2f}–{f['target_high']:.2f}%）")
+    else:
+        lines.append("> 🏦 市场隐含联邦基金利率：（获取失败，未计入）")
+    if market_prob:
+        lines.append(f"> 📊 **市场隐含加息概率(ZQ=F)：{market_prob['prob']}%**（{market_prob['label']}）← 真实市场定价(基准)")
+    if rate_prob:
+        lines.append(f"> 🎯 **综合研判加息概率(多维信号)：{rate_prob['prob']}%**（{rate_prob['label']}）")
+        if market_prob:
+            diff = rate_prob["prob"] - market_prob["prob"]
+            if abs(diff) >= 3:
+                tag = "偏高" if diff > 0 else "偏低"
+                lines.append(f"> 🔍 综合研判较市场隐含{tag} {abs(diff)} 个百分点"
+                             f"（差异来自新闻/油价/金价/恐慌等另类信号）")
+    lines.append("")
+
+    # —— 今日异动提醒 ——
+    if anomalies:
+        lines.append("## ⚠️ 今日异动提醒")
+        for a in anomalies:
+            lines.append(f"> {a}")
         lines.append("")
-    if market or rate_prob:
-        lines.append("## 💰 市场数据 & 当日加息概率")
-        g = market.get("gold") if market else None
-        o = market.get("oil") if market else None
+
+    # —— 市场数据（金价 / 国际油价）——
+    if market:
+        lines.append("## 💰 市场数据（金价 / 国际油价）")
+        g = market.get("gold")
+        o = market.get("oil")
         if g and g.get("ok"):
             arrow = "▲" if g["chg_pct"] >= 0 else "▼"
             lines.append(f"> 🥇 金价：{g['price']:.2f} 美元/盎司  {arrow} {g['chg_pct']:+.2f}%")
@@ -899,44 +994,9 @@ def format_message(items: list[dict], errors: list[str], social_enabled: bool = 
             lines.append(f"> 🛢️ 国际油价(布伦特)：{o['price']:.2f} 美元/桶  {arrow} {o['chg_pct']:+.2f}%")
         else:
             lines.append("> 🛢️ 国际油价：（获取失败，未计入）")
-        # 真实利率期货：市场隐含联邦基金利率（CME FedWatch 底层数据）
-        f = fed if (fed and fed.get("ok")) else None
-        if f:
-            farrow = "▲" if f["chg_bp"] >= 0 else "▼"
-            lines.append(f"> 🏦 市场隐含联邦基金利率(ZQ期货)：{f['implied_effr']:.2f}%  "
-                         f"{farrow} {f['chg_bp']:+.1f}bp（目标区间 {f['target_low']:.2f}–{f['target_high']:.2f}%）")
-        else:
-            lines.append("> 🏦 市场隐含联邦基金利率：（获取失败，未计入）")
-        if market_prob or rate_prob:
-            # 市场隐含加息概率（ZQ=F 真实定价，基准）
-            if market_prob:
-                lines.append(f"> 📊 **市场隐含加息概率(ZQ=F)：{market_prob['prob']}%**（{market_prob['label']}）")
-            # 综合研判加息概率（多维信号：新闻/油价/金价/恐慌 + 利率期货）
-            if rate_prob:
-                lines.append(f"> 🎯 **综合研判加息概率(多维信号)：{rate_prob['prob']}%**（{rate_prob['label']}）")
-                if market_prob:
-                    diff = rate_prob["prob"] - market_prob["prob"]
-                    if abs(diff) >= 3:
-                        tag = "偏高" if diff > 0 else "偏低"
-                        lines.append(f"> 🔍 综合研判较市场隐含{tag} {abs(diff)} 个百分点"
-                                     f"（差异来自新闻/油价/金价/恐慌等另类信号）")
-                lines.append(f"> 📝 {rate_prob['summary']}")
         lines.append("")
-    lines.append("## 📈 利率相关快讯")
-    if rate_items:
-        lines += _render_items(rate_items, 1, translate)
-    else:
-        lines.append("🤷 最近时间窗内没有命中「利率相关」的新闻。\n")
-    if social_enabled:
-        lines.append("## ⚡ 中东局势 · 社媒信号")
-        if social_items:
-            early_n = sum(1 for i in social_items if i.get("early"))
-            if early_n:
-                lines.append(f"> 其中 **{early_n}** 条疑似早于主流媒体、尚未被主流覆盖的信号，"
-                             f"请重点关注（或影响油价 / 避险 / 利率）\n")
-            lines += _render_items(social_items, len(rate_items) + 1, translate)
-        else:
-            lines.append("🤷 社媒未监测到中东战争相关的新发帖。\n")
+
+    # —— 霍尔木兹海峡通航监测（移到市场数据下方）——
     if hormuz and hormuz.get("ok"):
         lines.append("## ⚓ 霍尔木兹海峡通航监测")
         chg = hormuz.get("change_pct", 0.0)
@@ -950,6 +1010,19 @@ def format_message(items: list[dict], errors: list[str], social_enabled: bool = 
             lines.append("> ⚠️ **通航量骤降**：中东局势可能升级，油价/避险/利率或提前反应（早于主流媒体）。")
         if hormuz.get("latest_incomplete"):
             lines.append("> ℹ️ 当日数据仍在统计中，以上为最近完整日口径。")
+        lines.append("")
+
+    # —— 利率相关快讯 ——
+    lines.append("## 📈 利率相关快讯")
+    if rate_items:
+        lines += _render_items(rate_items, 1, translate)
+    else:
+        lines.append("🤷 最近时间窗内没有命中「利率相关」的新闻。\n")
+
+    # —— 社媒信号（仅摘要：列点 + 可点击 🔗 图标）——
+    if social_enabled:
+        lines.append("## 🔥 中东局势 · 转折点舆情（精选）")
+        lines += format_social_abstract(social_items, translate)
         lines.append("")
 
     if errors:
@@ -972,10 +1045,10 @@ def run_once(cfg: dict) -> None:
     social_enabled = cfg.get("social", {}).get("enabled", False)
     social_items, social_errors = [], []
     if social_enabled:
-        log.info("抓取社媒舆情（Reddit / Mastodon / Telegram）…")
+        log.info("抓取社媒舆情（Reddit RSS / Mastodon / Telegram），仅保留转折点舆情…")
         mainstream_texts = fetch_recent_texts(cfg)
         social_items, social_errors = collect_social(cfg, mainstream_texts)
-        log.info("社媒命中 %d 条（其中早期信号 %d 条）；源异常 %d 个。",
+        log.info("转折点舆情 %d 条（其中早期信号 %d 条）；源异常 %d 个。",
                  len(social_items), sum(1 for i in social_items if i.get("early")),
                  len(social_errors))
 
@@ -1032,6 +1105,31 @@ def run_once(cfg: dict) -> None:
         else:
             log.warning("霍尔木兹通航数据获取失败")
 
+    # 异动提醒：关注的数据出现明显波动时，主动在推送里提示
+    anomalies = []
+    if panic and panic["score"] >= 60:
+        anomalies.append(f"🌡️ 市场情绪指数升至 {panic['score']}（{panic['level']}），需警惕")
+    if market:
+        g = market.get("gold")
+        if g and g.get("ok") and abs(g["chg_pct"]) >= 2:
+            anomalies.append(f"🥇 金价异动 {g['chg_pct']:+.2f}%（{'大涨' if g['chg_pct'] > 0 else '大跌'}）")
+        o = market.get("oil")
+        if o and o.get("ok") and abs(o["chg_pct"]) >= 3:
+            anomalies.append(f"🛢️ 国际油价异动 {o['chg_pct']:+.2f}%（{'大涨' if o['chg_pct'] > 0 else '大跌'}）")
+    if fed and fed.get("ok") and abs(fed["chg_bp"]) >= 3:
+        anomalies.append(f"🏦 市场隐含联邦基金利率变动 {fed['chg_bp']:+.1f}bp"
+                         f"（目标区间 {fed['target_low']:.2f}–{fed['target_high']:.2f}%）")
+    if market_prob and rate_prob:
+        diff = rate_prob["prob"] - market_prob["prob"]
+        if abs(diff) >= 15:
+            tag = "高于" if diff > 0 else "低于"
+            anomalies.append(f"🎯 综合研判加息概率{tag}市场隐含 {abs(diff)} 个百分点"
+                             f"（{rate_prob['prob']}% vs {market_prob['prob']}%）")
+    if hormuz and hormuz.get("ok") and hormuz.get("abnormal"):
+        anomalies.append("⚓ 霍尔木兹海峡通航量骤降，中东局势或升级")
+    if anomalies:
+        log.info("今日异动 %d 项：%s", len(anomalies), "；".join(anomalies))
+
     # 全部合并为「一条」推送：早期信号不再单独发，直接带 ⚡ 标记进摘要
     if cfg.get("dedup", {}).get("enabled", True):
         store = SeenStore(cfg["dedup"]["seen_file"], cfg["dedup"].get("max_kept", 2000))
@@ -1040,7 +1138,7 @@ def run_once(cfg: dict) -> None:
         log.info("去重后待推送 %d 条（去除已推送 %d 条）。", len(combined), before - len(combined))
 
     title, content = format_message(combined, errors, social_enabled, translate,
-                                    panic, market, rate_prob, market_prob, fed, hormuz)
+                                    panic, market, rate_prob, market_prob, fed, hormuz, anomalies)
 
     if not combined:
         log.info("没有新内容，跳过推送。")
