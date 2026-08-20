@@ -88,6 +88,11 @@ CONFIG = {
             "叙利亚", "导弹", "空袭", "战争", "停火", "霍尔木兹", "原油", "油价",
         ],
     },
+    "hormuz": {
+        "enabled": True,
+        "api_base": "https://hormuz.data-tracking.net/api",
+        "drop_threshold": 0.25,   # 通航量较基线下降超 25% 即判定为异常
+    },
 }
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -658,6 +663,64 @@ def fetch_fed_funds(cfg: dict) -> dict | None:
             "target_high": fcfg.get("target_high", 3.75)}
 
 
+def fetch_hormuz_traffic(cfg: dict) -> dict | None:
+    """抓取霍尔木兹海峡通航数据（免费 JSON API，每30分钟轮询 AIS）。
+
+    两个端点：
+      - /api/crossings/daily ：每日通行统计（in_strait/inbound/outbound 计数）
+      - /api/ships           ：当前区域内每艘船的实时快照（含船型/区域/速度）
+    用「最新完整日通航量」对比近 7–14 日基线，骤降即视为中东局势升级的早期硬指标
+    （船减少 → 油价/避险/利率早于主流媒体反应）。失败时返回 {"ok": False}，不影响其余推送。
+    """
+    hcfg = cfg.get("hormuz", {})
+    if not hcfg.get("enabled", True):
+        return None
+    base = hcfg.get("api_base", "https://hormuz.data-tracking.net/api")
+    thr = hcfg.get("drop_threshold", 0.25)
+    out = {"ok": False, "source": base}
+    try:
+        r = requests.get(f"{base}/crossings/daily", timeout=15, headers={"User-Agent": UA})
+        r.raise_for_status()
+        rows = r.json()
+        series = sorted((x["day"], x["count"]) for x in rows
+                        if x.get("direction") == "in_strait" and x.get("count") is not None)
+        if len(series) >= 2:
+            latest_day, latest = series[-1]                       # 可能当天未统计完
+            prev_day, prev = series[-2]                           # 最新完整日
+            hist = [c for _, c in series[:-1]][-14:]              # 基线排除当天
+            baseline = sum(hist) / len(hist) if hist else float(prev)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            out.update({
+                "latest_day": latest_day, "latest_count": latest,
+                "prev_day": prev_day, "prev_count": prev,
+                "baseline": round(baseline, 1),
+                "latest_incomplete": latest_day >= today,
+            })
+            change = (prev - baseline) / baseline if baseline else 0.0
+            out["change_pct"] = round(change * 100, 1)
+            out["abnormal"] = change <= -thr
+            out["ok"] = True
+    except Exception as e:  # noqa: BLE001
+        log.warning("霍尔木兹通行统计获取失败: %s", e)
+    # 实时快照（当前海峡内船数 + 油轮数），不受「日聚合未完成」影响
+    try:
+        r2 = requests.get(f"{base}/ships", timeout=15, headers={"User-Agent": UA})
+        r2.raise_for_status()
+        ships = r2.json()
+        if isinstance(ships, list):
+            strait = [s for s in ships if s.get("zone") == "strait"]
+            tanker_cats = ("Crude Oil Tanker", "LNG Tanker", "LPG/LNG Tanker",
+                           "Oil Products Tanker", "Chemical/Oil Products Tanker")
+            tankers = [s for s in strait if s.get("ship_category") in tanker_cats]
+            out["snapshot_total"] = len(ships)
+            out["snapshot_strait"] = len(strait)
+            out["snapshot_tankers"] = len(tankers)
+            out["snapshot_ts"] = strait[0].get("timestamp") if strait else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("霍尔木兹实时船只获取失败: %s", e)
+    return out
+
+
 # ------------------------- 当日「加息概率」量化 + 定性 -------------------------
 HAWKISH_TERMS = ["rate hike", "加息", "inflation", "cpi", "pce", "tighten",
                  "surge", "hot", "wage", "hawkish", "鹰派", "超预期"]
@@ -748,6 +811,34 @@ def analyze_rate_prob(news_items: list[dict], panic: dict | None,
             "news_s": round(news_s, 3), "oil_s": round(oil_s, 3), "gold_s": round(gold_s, 3)}
 
 
+def market_rate_prob(fed: dict | None) -> dict | None:
+    """市场隐含加息概率：直接由 ZQ=F（30天联邦基金期货）定价推导（CME FedWatch 同源）。
+
+    这一路就是『市场真实定价』本身，故不再压权重，作为每日推送的【基准概率】。
+    与 analyze_rate_prob（综合研判）并排展示，二者之差即另类信号带来的偏移。
+    """
+    if not fed or not fed.get("ok"):
+        return None
+    chg = fed.get("chg_bp", 0.0)
+    fed_s = max(-1.0, min(1.0, chg / 5.0))   # 每 ±5bp 记满格
+    bias = 0.15 * fed_s                        # 与 analyze_rate_prob 中 fed 一路保持一致（±5bp→±11%）
+    prob = round(100 / (1 + math.exp(-bias * 3.0)))
+    if prob >= 65:
+        label = "偏加息（鹰派）"
+    elif prob >= 55:
+        label = "中性偏鹰"
+    elif prob > 45:
+        label = "中性"
+    elif prob > 35:
+        label = "中性偏鸽"
+    else:
+        label = "偏降息（鸽派）"
+    direction = "上行" if chg >= 0 else "下行"
+    return {"prob": prob, "bias": round(bias, 3), "label": label,
+            "summary": f"市场隐含利率{direction}{abs(chg):.1f}bp（目标区间 "
+                       f"{fed['target_low']:.2f}–{fed['target_high']:.2f}%），CME FedWatch 同源定价。"}
+
+
 # ------------------------- 排版 -------------------------
 def _beijing_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=8)
@@ -780,7 +871,8 @@ def _render_items(items: list[dict], start_idx: int = 1, translate: bool = True)
 def format_message(items: list[dict], errors: list[str], social_enabled: bool = False,
                    translate: bool = True, panic: dict | None = None,
                    market: dict | None = None, rate_prob: dict | None = None,
-                   fed: dict | None = None):
+                   market_prob: dict | None = None, fed: dict | None = None,
+                   hormuz: dict | None = None):
     now = _beijing_now().strftime("%Y-%m-%d %H:%M")
     title = f"📈 美股利率快讯 · 中东局势（{now}）"
     rate_items = [i for i in items if i.get("kind") != "social"]
@@ -815,9 +907,20 @@ def format_message(items: list[dict], errors: list[str], social_enabled: bool = 
                          f"{farrow} {f['chg_bp']:+.1f}bp（目标区间 {f['target_low']:.2f}–{f['target_high']:.2f}%）")
         else:
             lines.append("> 🏦 市场隐含联邦基金利率：（获取失败，未计入）")
-        if rate_prob:
-            lines.append(f"> 🎯 **当日加息概率：{rate_prob['prob']}%**（{rate_prob['label']}）")
-            lines.append(f"> 📝 {rate_prob['summary']}")
+        if market_prob or rate_prob:
+            # 市场隐含加息概率（ZQ=F 真实定价，基准）
+            if market_prob:
+                lines.append(f"> 📊 **市场隐含加息概率(ZQ=F)：{market_prob['prob']}%**（{market_prob['label']}）")
+            # 综合研判加息概率（多维信号：新闻/油价/金价/恐慌 + 利率期货）
+            if rate_prob:
+                lines.append(f"> 🎯 **综合研判加息概率(多维信号)：{rate_prob['prob']}%**（{rate_prob['label']}）")
+                if market_prob:
+                    diff = rate_prob["prob"] - market_prob["prob"]
+                    if abs(diff) >= 3:
+                        tag = "偏高" if diff > 0 else "偏低"
+                        lines.append(f"> 🔍 综合研判较市场隐含{tag} {abs(diff)} 个百分点"
+                                     f"（差异来自新闻/油价/金价/恐慌等另类信号）")
+                lines.append(f"> 📝 {rate_prob['summary']}")
         lines.append("")
     lines.append("## 📈 利率相关快讯")
     if rate_items:
@@ -834,6 +937,21 @@ def format_message(items: list[dict], errors: list[str], social_enabled: bool = 
             lines += _render_items(social_items, len(rate_items) + 1, translate)
         else:
             lines.append("🤷 社媒未监测到中东战争相关的新发帖。\n")
+    if hormuz and hormuz.get("ok"):
+        lines.append("## ⚓ 霍尔木兹海峡通航监测")
+        chg = hormuz.get("change_pct", 0.0)
+        arrow = "↓" if chg < 0 else "↑"
+        lines.append(f"> 🚢 最新完整日通航：{hormuz['prev_count']} 艘"
+                     f"（基线 {hormuz['baseline']} 艘，{arrow} {abs(chg):.0f}%）")
+        if hormuz.get("snapshot_strait") is not None:
+            lines.append(f"> 🛢️ 实时海峡内在航：{hormuz['snapshot_strait']} 艘"
+                         f"（油轮/LNG {hormuz['snapshot_tankers']} 艘）")
+        if hormuz.get("abnormal"):
+            lines.append("> ⚠️ **通航量骤降**：中东局势可能升级，油价/避险/利率或提前反应（早于主流媒体）。")
+        if hormuz.get("latest_incomplete"):
+            lines.append("> ℹ️ 当日数据仍在统计中，以上为最近完整日口径。")
+        lines.append("")
+
     if errors:
         lines.append("⚠️ 部分源抓取异常：")
         for e in errors:
@@ -898,6 +1016,22 @@ def run_once(cfg: dict) -> None:
         rate_prob = analyze_rate_prob(news_items, panic, market, fed)
         log.info("当日加息概率：%d%%（%s）", rate_prob["prob"], rate_prob["label"])
 
+    # 市场隐含加息概率（ZQ=F 真实定价，作为基准，与综合研判并排展示）
+    market_prob = market_rate_prob(fed)
+    if market_prob:
+        log.info("市场隐含加息概率(ZQ=F)：%d%%（%s）", market_prob["prob"], market_prob["label"])
+
+    # 霍尔木兹海峡通航监测（早期硬指标：船真不走，比新闻/油价更早）
+    hormuz = None
+    if cfg.get("hormuz", {}).get("enabled", True):
+        log.info("抓取霍尔木兹海峡通航数据…")
+        hormuz = fetch_hormuz_traffic(cfg)
+        if hormuz and hormuz.get("ok"):
+            log.info("霍尔木兹最新完整日通航 %d 艘（基线 %.1f，变化 %+.1f%%）",
+                     hormuz["prev_count"], hormuz["baseline"], hormuz["change_pct"])
+        else:
+            log.warning("霍尔木兹通航数据获取失败")
+
     # 全部合并为「一条」推送：早期信号不再单独发，直接带 ⚡ 标记进摘要
     if cfg.get("dedup", {}).get("enabled", True):
         store = SeenStore(cfg["dedup"]["seen_file"], cfg["dedup"].get("max_kept", 2000))
@@ -906,7 +1040,7 @@ def run_once(cfg: dict) -> None:
         log.info("去重后待推送 %d 条（去除已推送 %d 条）。", len(combined), before - len(combined))
 
     title, content = format_message(combined, errors, social_enabled, translate,
-                                    panic, market, rate_prob, fed)
+                                    panic, market, rate_prob, market_prob, fed, hormuz)
 
     if not combined:
         log.info("没有新内容，跳过推送。")
