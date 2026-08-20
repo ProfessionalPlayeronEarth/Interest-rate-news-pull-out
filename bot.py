@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -32,20 +33,35 @@ CONFIG = {
          "url": "https://www.federalreserve.gov/feeds/press_all.xml"},
     ],
     "rate_keywords": [
-        "rate", "rates", "interest rate", "federal reserve", "fomc", "powell",
+        # —— 利率 / 货币政策（原有）——
+        "rate", "rates", "interest rate", "federal reserve", "fomc", "powell", "warsh",
         "treasury", "yield", "yields", "bond", "bonds", "inflation", "ecb",
         "rate cut", "rate hike", "降息", "加息", "利率", "美联储", "国债", "通胀",
-        "收益率", "鲍威尔",
+        "收益率", "鲍威尔", "沃什",
+        # —— 关键经济数据发布（新增：直接驱动利率的硬数据）——
+        "cpi", "pce", "ppi", "gdp", "retail sales", "durable goods", "pmi",
+        "nonfarm", "non-farm", "payroll", "nfp", "adp", "jobs report",
+        "employment report", "consumer price", "producer price",
+        "消费者物价", "生产者物价", "个人消费支出", "非农", "非农就业",
+        "就业报告", "小非农", "国内生产总值", "采购经理指数", "零售销售",
     ],
     "strong_keywords": [
         "rate cut", "rate hike", "interest rate", "fomc", "federal reserve",
-        "powell", "treasury yield", "降息", "加息", "利率", "美联储", "鲍威尔",
+        "powell", "warsh", "treasury yield", "降息", "加息", "利率", "美联储", "鲍威尔", "沃什",
+        # 数据发布里最重磅的也标为强相关（置顶 + ⭐）
+        "cpi", "pce", "nonfarm", "non-farm", "payroll", "jobs report",
+        "消费者物价", "非农", "非农就业", "就业报告",
     ],
     "fetch": {"max_items_per_source": 30, "lookback_hours": 24, "request_timeout": 15},
     "schedule": {"timezone": "Asia/Shanghai",
                  "times": ["07:30", "12:30", "21:30"], "run_immediately": False},
     "dedup": {"enabled": True, "seen_file": "data/seen.json", "max_kept": 2000},
     "translate": True,          # 是否把英文标题/摘要翻译成中文（失败则回退原文）
+    "panic_index": {"enabled": True},  # 每日「恐慌指数」舆情量化开关
+    "market": {"enabled": True, "gold_symbol": "GC=F", "oil_symbol": "BZ=F"},  # 金价/国际油价
+    "fed_funds": {"enabled": True, "symbol": "ZQ=F",
+                  "target_low": 3.50, "target_high": 3.75},  # 30天联邦基金期货(CME FedWatch 底层真实数据)
+    "rate_prob": {"enabled": True},    # 当日「加息概率」量化+定性分析开关
     "social": {
         "enabled": True,
         "urgent_alert": True,
@@ -512,6 +528,226 @@ class SeenStore:
         return fresh
 
 
+# ------------------------- 恐慌指数（舆情量化）-------------------------
+FEAR_WORDS = [
+    # 英文
+    "recession", "crash", "selloff", "sell-off", "panic", "default", "turmoil",
+    "plunge", "crisis", "volatile", "volatility", "rate cut", "rate hike",
+    "war", "invasion", "missile", "airstrike", "ceasefire broken", "default risk",
+    "oil spike", "stagflation", "bear market", "flight to safety",
+    # 中文
+    "崩盘", "暴跌", "恐慌", "衰退", "危机", "避险", "战争", "空袭", "导弹",
+    "动荡", "违约", "滞胀", "熊市", "抛售", "失业率",
+]
+
+
+def compute_panic_index(news_items: list[dict], social_items: list[dict]) -> dict:
+    """根据当日抓取到的新闻 + 社媒信号，量化一个 0-100 的「市场恐慌指数」。
+
+    维度与权重（各维度封顶后相加，最终 clamp 到 100）：
+      · 利率快讯条数        最多 8 条  ×4  = 32
+      · 其中强相关(⭐)条数  最多 5 条  ×5  = 25
+      · 社媒地缘信号条数    最多 6 条  ×3  = 18
+      · 其中早期(⚡)信号    最多 4 条  ×6  = 24
+      · 命中恐惧词种类      最多 6 种  ×3  = 18
+    """
+    rate_n = len(news_items)
+    strong_n = sum(1 for i in news_items if i.get("strong"))
+    social_n = len(social_items)
+    early_n = sum(1 for i in social_items if i.get("early"))
+
+    blob = " ".join(
+        (i.get("title", "") + " " + i.get("summary", "") + " " + i.get("text", "")).lower()
+        for i in news_items + social_items
+    )
+    fear_hits = sum(1 for w in FEAR_WORDS if w.lower() in blob)
+
+    score = 0
+    score += min(rate_n, 8) * 4
+    score += min(strong_n, 5) * 5
+    score += min(social_n, 6) * 3
+    score += min(early_n, 4) * 6
+    score += min(fear_hits, 6) * 3
+    score = max(0, min(100, score))
+
+    if score <= 20:
+        level = "平静"
+    elif score <= 40:
+        level = "关注"
+    elif score <= 60:
+        level = "警惕"
+    elif score <= 80:
+        level = "紧张"
+    else:
+        level = "极度恐慌"
+
+    return {
+        "score": score, "level": level,
+        "rate_n": rate_n, "strong_n": strong_n,
+        "social_n": social_n, "early_n": early_n, "fear_hits": fear_hits,
+    }
+
+
+def _panic_bar(score: int) -> str:
+    filled = round(score / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+# ------------------------- 市场数据（金价 / 国际油价）-------------------------
+def fetch_yahoo(symbol: str, host: str = "query1", timeout: int = 10):
+    url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}"
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": UA})
+    r.raise_for_status()
+    meta = r.json()["chart"]["result"][0]["meta"]
+    price = meta.get("regularMarketPrice")
+    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+    if price is None or prev is None:
+        raise ValueError("雅虎返回字段缺失")
+    return float(price), float(prev)
+
+
+def fetch_market_data(cfg: dict) -> dict | None:
+    """抓取金价(COMEX)与布伦特原油价格及涨跌幅；任一源失败则单独标记，不中断。"""
+    mcfg = cfg.get("market", {})
+    if not mcfg.get("enabled", True):
+        return None
+    out = {}
+    for key, sym in (("gold", mcfg.get("gold_symbol", "GC=F")),
+                     ("oil", mcfg.get("oil_symbol", "BZ=F"))):
+        price = prev = None
+        for host in ("query1", "query2"):
+            try:
+                price, prev = fetch_yahoo(sym, host, timeout=10)
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.warning("市场数据 %s 获取失败(%s): %s", sym, host, exc)
+        if price is not None and prev:
+            out[key] = {"price": price, "prev": prev,
+                        "chg_pct": (price - prev) / prev * 100, "ok": True}
+        else:
+            out[key] = {"ok": False}
+    return out
+
+
+def fetch_fed_funds(cfg: dict) -> dict | None:
+    """抓取 30天联邦基金期货(ZQ=F) → 市场隐含联邦基金利率(EFFR)。
+
+    隐含利率 = 100 - 期货价格（CME FedWatch 官方方法）。
+    这是比纯启发式更权威的「真实利率信号」：FedWatch 工具本身就是由
+    30天联邦基金期货定价算出来的，我们直接取这层底层真实数据。
+    失败不影响其余推送。
+    """
+    fcfg = cfg.get("fed_funds", {})
+    if not fcfg.get("enabled", True):
+        return None
+    sym = fcfg.get("symbol", "ZQ=F")
+    price = prev = None
+    for host in ("query1", "query2"):
+        try:
+            price, prev = fetch_yahoo(sym, host, timeout=10)
+            break
+        except Exception as exc:  # noqa: BLE001
+            log.warning("联邦基金期货 %s 获取失败(%s): %s", sym, host, exc)
+    if price is None or prev is None:
+        return {"ok": False}
+    implied = 100.0 - price                  # 市场隐含当月平均 EFFR(%)
+    implied_prev = 100.0 - prev
+    chg_bp = (implied - implied_prev) * 100  # 日变化(基点)
+    return {"ok": True, "price": price, "implied_effr": implied, "chg_bp": chg_bp,
+            "target_low": fcfg.get("target_low", 3.5),
+            "target_high": fcfg.get("target_high", 3.75)}
+
+
+# ------------------------- 当日「加息概率」量化 + 定性 -------------------------
+HAWKISH_TERMS = ["rate hike", "加息", "inflation", "cpi", "pce", "tighten",
+                 "surge", "hot", "wage", "hawkish", "鹰派", "超预期"]
+DOVISH_TERMS = ["rate cut", "降息", "cooling", "slowdown", "recession", "missed",
+                "weak", "soft landing", "layoff", "dovish", "鸽派", "低于预期"]
+
+
+def _news_policy_score(news_items: list[dict]) -> float:
+    """对利率新闻做多空打分：+1=全面鹰派(加息)，-1=全面鸽派(降息)。"""
+    total_w = 0.0
+    signed = 0.0
+    for it in news_items:
+        hay = (it.get("title", "") + " " + it.get("summary", "")).lower()
+        h = len(_match_keywords(hay, HAWKISH_TERMS))
+        d = len(_match_keywords(hay, DOVISH_TERMS))
+        w = 1.0 if it.get("strong") else 0.5
+        signed += (h - d) * w
+        total_w += w
+    if total_w == 0:
+        return 0.0
+    return max(-1.0, min(1.0, signed / total_w))
+
+
+def analyze_rate_prob(news_items: list[dict], panic: dict | None,
+                     market: dict | None, fed: dict | None = None) -> dict:
+    news_s = _news_policy_score(news_items)
+
+    oil_s = gold_s = 0.0
+    oil_txt = gold_txt = ""
+    if market:
+        o = market.get("oil")
+        if o and o.get("ok"):
+            oil_s = max(-1.0, min(1.0, o["chg_pct"] / 3.0))   # 油价涨→通胀→偏加息
+            oil_txt = f"国际油价{o['chg_pct']:+.1f}%（{'通胀压力↑' if o['chg_pct'] > 0 else '通胀缓解↓'}）"
+        g = market.get("gold")
+        if g and g.get("ok"):
+            gold_s = max(-1.0, min(1.0, -g["chg_pct"] / 3.0))  # 金价涨→避险/降息预期→偏鸽
+            gold_txt = f"金价{g['chg_pct']:+.1f}%（{'避险/降息预期↑' if g['chg_pct'] > 0 else '风险偏好回升'}）"
+
+    # 真实利率期货信号：市场隐含联邦基金利率的「日变化」驱动（上行→偏加息）。
+    # 这是 CME FedWatch 的底层数据，比金价/油价启发式更贴近真实市场定价。
+    fed_s = 0.0
+    fed_txt = ""
+    if fed and fed.get("ok"):
+        chg = fed.get("chg_bp", 0.0)
+        fed_s = max(-1.0, min(1.0, chg / 5.0))   # 每 ±5bp 记满格
+        direction = "上行" if chg >= 0 else "下行"
+        fed_txt = (f"联邦基金期货隐含利率{fed['implied_effr']:.2f}%（{direction}{abs(chg):.1f}bp，"
+                   f"目标区间 {fed['target_low']:.2f}–{fed['target_high']:.2f}%）")
+
+    panic_s = 0.0
+    ps = panic["score"] if panic else 0
+    if ps >= 70:
+        panic_s = -0.15   # 极端恐慌通常伴随宽松/救市预期，略压低加息概率
+    elif ps <= 20:
+        panic_s = 0.05
+
+    # 综合偏置 bias∈[-1,1]，权重：新闻0.40 / 油价0.25 / 金价0.10 / 利率期货0.15 / 恐慌0.10
+    bias = (0.40 * news_s + 0.25 * oil_s + 0.10 * gold_s
+            + 0.15 * fed_s + 0.10 * panic_s)
+    bias = max(-1.0, min(1.0, bias))
+    # logistic 映射到 0-100%，bias=0→50%
+    prob = round(100 / (1 + math.exp(-bias * 3.0)))
+
+    if prob >= 65:
+        label = "偏加息（鹰派）"
+    elif prob >= 55:
+        label = "中性偏鹰"
+    elif prob > 45:
+        label = "中性"
+    elif prob > 35:
+        label = "中性偏鸽"
+    else:
+        label = "偏降息（鸽派）"
+
+    drivers = [f"新闻面{'偏鹰' if news_s > 0.1 else ('偏鸽' if news_s < -0.1 else '中性')}（{news_s:+.2f}）"]
+    if oil_txt:
+        drivers.append(oil_txt)
+    if gold_txt:
+        drivers.append(gold_txt)
+    if fed_txt:
+        drivers.append("真实利率期货→" + fed_txt)
+    drivers.append(f"恐慌指数{ps}" + ("（极端情绪，略压低加息预期）" if ps >= 70
+                                      else ("（市场平静）" if ps <= 20 else "（关注）")))
+    summary = "；".join(drivers) + f"。综合研判：当日加息概率约 {prob}%，{label}。"
+
+    return {"prob": prob, "bias": round(bias, 3), "label": label, "summary": summary,
+            "news_s": round(news_s, 3), "oil_s": round(oil_s, 3), "gold_s": round(gold_s, 3)}
+
+
 # ------------------------- 排版 -------------------------
 def _beijing_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=8)
@@ -542,12 +778,47 @@ def _render_items(items: list[dict], start_idx: int = 1, translate: bool = True)
 
 
 def format_message(items: list[dict], errors: list[str], social_enabled: bool = False,
-                   translate: bool = True):
+                   translate: bool = True, panic: dict | None = None,
+                   market: dict | None = None, rate_prob: dict | None = None,
+                   fed: dict | None = None):
     now = _beijing_now().strftime("%Y-%m-%d %H:%M")
     title = f"📈 美股利率快讯 · 中东局势（{now}）"
     rate_items = [i for i in items if i.get("kind") != "social"]
     social_items = [i for i in items if i.get("kind") == "social"]
     lines = [f"⏰ **{now}（北京时间）** · 利率 **{len(rate_items)}** 条 · 社媒信号 **{len(social_items)}** 条", ""]
+    if panic:
+        lines.append(f"## 🌡️ 今日市场恐慌指数：{panic['score']} / 100（{panic['level']}）")
+        lines.append(f"> `{_panic_bar(panic['score'])}`  {panic['score']}")
+        lines.append(f"> 📊 利率快讯 {panic['rate_n']} 条(强相关 {panic['strong_n']}) · "
+                     f"社媒信号 {panic['social_n']} 条(早期 {panic['early_n']}) · "
+                     f"恐惧词命中 {panic['fear_hits']} 种")
+        lines.append("")
+    if market or rate_prob:
+        lines.append("## 💰 市场数据 & 当日加息概率")
+        g = market.get("gold") if market else None
+        o = market.get("oil") if market else None
+        if g and g.get("ok"):
+            arrow = "▲" if g["chg_pct"] >= 0 else "▼"
+            lines.append(f"> 🥇 金价：{g['price']:.2f} 美元/盎司  {arrow} {g['chg_pct']:+.2f}%")
+        else:
+            lines.append("> 🥇 金价：（获取失败，未计入）")
+        if o and o.get("ok"):
+            arrow = "▲" if o["chg_pct"] >= 0 else "▼"
+            lines.append(f"> 🛢️ 国际油价(布伦特)：{o['price']:.2f} 美元/桶  {arrow} {o['chg_pct']:+.2f}%")
+        else:
+            lines.append("> 🛢️ 国际油价：（获取失败，未计入）")
+        # 真实利率期货：市场隐含联邦基金利率（CME FedWatch 底层数据）
+        f = fed if (fed and fed.get("ok")) else None
+        if f:
+            farrow = "▲" if f["chg_bp"] >= 0 else "▼"
+            lines.append(f"> 🏦 市场隐含联邦基金利率(ZQ期货)：{f['implied_effr']:.2f}%  "
+                         f"{farrow} {f['chg_bp']:+.1f}bp（目标区间 {f['target_low']:.2f}–{f['target_high']:.2f}%）")
+        else:
+            lines.append("> 🏦 市场隐含联邦基金利率：（获取失败，未计入）")
+        if rate_prob:
+            lines.append(f"> 🎯 **当日加息概率：{rate_prob['prob']}%**（{rate_prob['label']}）")
+            lines.append(f"> 📝 {rate_prob['summary']}")
+        lines.append("")
     lines.append("## 📈 利率相关快讯")
     if rate_items:
         lines += _render_items(rate_items, 1, translate)
@@ -593,6 +864,40 @@ def run_once(cfg: dict) -> None:
     errors = news_errors + social_errors
     combined = news_items + social_items
 
+    # 计算每日恐慌指数（基于本次抓取到的全部信号）
+    panic = None
+    if cfg.get("panic_index", {}).get("enabled", True):
+        panic = compute_panic_index(news_items, social_items)
+        log.info("今日恐慌指数：%d / 100（%s）", panic["score"], panic["level"])
+
+    # 抓取市场数据（金价 / 国际油价），失败不影响其余推送
+    market = None
+    if cfg.get("market", {}).get("enabled", True):
+        log.info("抓取市场数据（金价 / 国际油价）…")
+        market = fetch_market_data(cfg)
+        if market:
+            for k, v in market.items():
+                if v.get("ok"):
+                    log.info("%s：%.2f（%+.2f%%）", k, v["price"], v["chg_pct"])
+                else:
+                    log.warning("%s：获取失败", k)
+
+    # 抓取真实利率期货（30天联邦基金期货 ZQ=F → 市场隐含联邦基金利率；CME FedWatch 底层数据）
+    fed = None
+    if cfg.get("fed_funds", {}).get("enabled", True):
+        log.info("抓取联邦基金期货(ZQ=F) → 市场隐含利率…")
+        fed = fetch_fed_funds(cfg)
+        if fed and fed.get("ok"):
+            log.info("市场隐含联邦基金利率：%.2f%%（%+.1fbp）", fed["implied_effr"], fed["chg_bp"])
+        else:
+            log.warning("联邦基金期货：获取失败")
+
+    # 当日加息概率（量化 + 定性）：结合新闻多空、金价、油价、真实利率期货、恐慌指数
+    rate_prob = None
+    if cfg.get("rate_prob", {}).get("enabled", True):
+        rate_prob = analyze_rate_prob(news_items, panic, market, fed)
+        log.info("当日加息概率：%d%%（%s）", rate_prob["prob"], rate_prob["label"])
+
     # 全部合并为「一条」推送：早期信号不再单独发，直接带 ⚡ 标记进摘要
     if cfg.get("dedup", {}).get("enabled", True):
         store = SeenStore(cfg["dedup"]["seen_file"], cfg["dedup"].get("max_kept", 2000))
@@ -600,7 +905,8 @@ def run_once(cfg: dict) -> None:
         combined = store.filter_new(combined)
         log.info("去重后待推送 %d 条（去除已推送 %d 条）。", len(combined), before - len(combined))
 
-    title, content = format_message(combined, errors, social_enabled, translate)
+    title, content = format_message(combined, errors, social_enabled, translate,
+                                    panic, market, rate_prob, fed)
 
     if not combined:
         log.info("没有新内容，跳过推送。")
