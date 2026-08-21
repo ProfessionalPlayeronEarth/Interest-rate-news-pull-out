@@ -533,10 +533,11 @@ def push(cfg: dict, title: str, content: str):
 
 # ------------------------- 去重 -------------------------
 class SeenStore:
-    def __init__(self, path: str, max_kept: int = 2000):
+    def __init__(self, path: str, max_kept: int = 2000, max_age_hours: float = 72):
         from pathlib import Path
         self.path = Path(path)
         self.max_kept = max_kept
+        self.max_age_hours = max_age_hours
         self.seen = self._load()
 
     def _load(self) -> dict:
@@ -544,7 +545,11 @@ class SeenStore:
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8") or "{}")
                 if isinstance(data, dict):
-                    return data
+                    now = time.time()
+                    # 丢弃超过有效期（默认 72h）的旧记录：避免去重库无限增长、
+                    # 也避免「曾成功推送过的旧条目」永久压制后续运行，导致收不到任何推送。
+                    return {k: v for k, v in data.items()
+                            if now - v <= self.max_age_hours * 3600}
             except (json.JSONDecodeError, OSError):
                 pass
         return {}
@@ -1136,7 +1141,8 @@ def run_once(cfg: dict) -> None:
 
     # 全部合并为「一条」推送：早期信号不再单独发，直接带 ⚡ 标记进摘要
     if cfg.get("dedup", {}).get("enabled", True):
-        store = SeenStore(cfg["dedup"]["seen_file"], cfg["dedup"].get("max_kept", 2000))
+        store = SeenStore(cfg["dedup"]["seen_file"], cfg["dedup"].get("max_kept", 2000),
+                          cfg["dedup"].get("max_age_hours", 72))
         before = len(combined)
         combined = store.filter_new(combined)
         log.info("去重后待推送 %d 条（去除已推送 %d 条）。", len(combined), before - len(combined))
@@ -1144,9 +1150,14 @@ def run_once(cfg: dict) -> None:
     title, content = format_message(combined, errors, social_enabled, translate,
                                     panic, market, rate_prob, market_prob, fed, hormuz, anomalies)
 
-    if not combined:
-        log.info("没有新内容，跳过推送。")
+    # 合并去重后：有新闻/社媒则推送完整版；没有但抓到了市场快照（金价/油价/利率/霍尔木兹），
+    # 也照常推送轻量版，避免「连续运行被去重清空 → 绿✓ 但不推 → 彻底收不到任何消息」。
+    has_snapshot = bool(market or fed or hormuz)
+    if not combined and not has_snapshot:
+        log.info("没有抓到任何新闻/社媒/市场数据，跳过推送。")
         return
+    if not combined:
+        log.info("无新增新闻/舆情，但已抓到市场快照，仍推送轻量版（含金价/油价/利率/霍尔木兹）。")
 
     ok, msg = push(cfg, title, content)
     if ok:
