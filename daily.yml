@@ -1,0 +1,31 @@
+name: 美股利率快讯推送
+
+on:
+  schedule:
+    - cron: "30 23 * * *"
+    - cron: "30 4 * * *"
+    - cron: "30 13 * * *"
+  workflow_dispatch:
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装依赖
+        run: pip install --quiet feedparser requests
+      - name: 恢复去重记录
+        uses: actions/cache@v4
+        with:
+          path: data/seen.json
+          key: us-stock-seen-${{ github.run_id }}
+          restore-keys: |
+            us-stock-seen-
+      - name: 运行推送
+        env:
+          TZ: "Asia/Shanghai"
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python bot.py
