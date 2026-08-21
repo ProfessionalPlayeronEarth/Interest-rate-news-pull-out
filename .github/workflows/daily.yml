@@ -1,5 +1,6 @@
 name: 美股利率快讯推送
 
+# 每天北京时间 07:30 / 12:30 / 21:30 自动运行（GitHub Actions 用 UTC，故 -8 小时）
 on:
   schedule:
     - cron: "30 23 * * *"
@@ -13,8 +14,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - name: 安装依赖
         run: pip install --quiet feedparser requests
+
+      # 跨运行保留去重记录，避免同一新闻每天被重复推送
       - name: 恢复去重记录
         uses: actions/cache@v4
         with:
@@ -22,6 +26,8 @@ jobs:
           key: us-stock-seen-${{ github.run_id }}
           restore-keys: |
             us-stock-seen-
+
+      # 填了哪个密钥就自动用哪个渠道；程序在仓库根目录的 bot.py
       - name: 运行推送
         env:
           TZ: "Asia/Shanghai"
